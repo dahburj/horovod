@@ -48,8 +48,16 @@ Status Status::InvalidArgument(std::string message) {
   return Status(StatusType::INVALID_ARGUMENT, message);
 }
 
+Status Status::InProgress() {
+  return Status(StatusType::IN_PROGRESS, "");
+}
+
 bool Status::ok() const {
   return type_ == StatusType::OK;
+}
+
+bool Status::in_progress() const {
+  return type_ == StatusType::IN_PROGRESS;
 }
 
 StatusType Status::type() const {
@@ -73,7 +81,7 @@ void TensorShape::AppendShape(TensorShape& other) {
 const std::string TensorShape::DebugString() const {
   std::stringstream args;
   args << "[";
-  for (auto it = shape_.begin(); it != shape_.end(); it++) {
+  for (auto it = shape_.begin(); it != shape_.end(); ++it) {
     if (it != shape_.begin()) {
       args << ", ";
     }
@@ -100,6 +108,8 @@ int64_t TensorShape::num_elements() const {
   }
   return result;
 }
+
+const std::vector<int64_t>& TensorShape::to_vector() const { return shape_; }
 
 } // namespace common
 } // namespace horovod

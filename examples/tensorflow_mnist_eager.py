@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 # Copyright 2018 Uber Technologies, Inc. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-#!/usr/bin/env python
 
 import tensorflow as tf
 import horovod.tensorflow as hvd
@@ -42,7 +42,7 @@ def main(_):
         tf.keras.datasets.mnist.load_data(path='mnist-%d.npz' % hvd.rank())
 
     dataset = tf.data.Dataset.from_tensor_slices(
-        (tf.cast(mnist_images[..., tf.newaxis] / 255, tf.float32),
+        (tf.cast(mnist_images[..., tf.newaxis] / 255.0, tf.float32),
          tf.cast(mnist_labels, tf.int64))
     )
     dataset = dataset.shuffle(1000).batch(32)
@@ -63,7 +63,7 @@ def main(_):
         # This is necessary to ensure consistent initialization of all workers when
         # training is started with random weights or restored from a checkpoint.
         if batch == 0:
-            hvd.broadcast_variables(0, mnist_model.variables)
+            hvd.broadcast_variables(mnist_model.variables, root_rank=0)
 
         # Horovod: add Horovod Distributed GradientTape.
         tape = hvd.DistributedGradientTape(tape)

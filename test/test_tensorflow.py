@@ -1,5 +1,6 @@
 # Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 # Modifications copyright (C) 2018 Uber Technologies, Inc.
+# Modifications copyright (C) 2019 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,6 +23,7 @@ from __future__ import print_function
 
 import itertools
 import numpy as np
+import os
 import tensorflow as tf
 from horovod.tensorflow.util import _executing_eagerly, _has_eager
 from tensorflow.python.framework import ops
@@ -35,8 +37,12 @@ config = tf.ConfigProto()
 config.gpu_options.allow_growth = True
 
 if _has_eager:
-    from tensorflow.python.framework.test_util import run_all_in_graph_and_eager_modes
+    # Specifies the config to use with eager execution. Does not preclude
+    # tests from running in the graph mode.
     tf.enable_eager_execution(config=config)
+
+# MLSL supports only byte, float and double data types
+mlsl_supported_types = set([tf.float32, tf.float64])
 
 
 class MPITests(tf.test.TestCase):
@@ -60,6 +66,11 @@ class MPITests(tf.test.TestCase):
         else:
             return sess.run(tensors)
 
+    def filter_supported_types(self, types):
+        if 'MLSL_ROOT' in os.environ:
+           types = [t for t in types if t in mlsl_supported_types]
+        return types
+
     def test_horovod_rank(self):
         """Test that the rank returned by hvd.rank() is correct."""
         true_rank, _ = mpi_env_rank_and_size()
@@ -78,7 +89,7 @@ class MPITests(tf.test.TestCase):
         """Test on CPU that the allreduce correctly sums 1D, 2D, 3D tensors."""
         hvd.init()
         size = hvd.size()
-        dtypes = [tf.int32, tf.int64, tf.float16, tf.float32, tf.float64]
+        dtypes = self.filter_supported_types([tf.int32, tf.int64, tf.float16, tf.float32, tf.float64])
         dims = [1, 2, 3]
         for dtype, dim in itertools.product(dtypes, dims):
             with tf.device("/cpu:0"):
@@ -109,7 +120,7 @@ class MPITests(tf.test.TestCase):
         with Tensor Fusion."""
         hvd.init()
         size = hvd.size()
-        dtypes = [tf.int32, tf.int64, tf.float16, tf.float32, tf.float64]
+        dtypes = self.filter_supported_types([tf.int32, tf.int64, tf.float16, tf.float32, tf.float64])
         dims = [1, 2, 3]
         tests = []
         for dtype, dim in itertools.product(dtypes, dims):
@@ -138,13 +149,13 @@ class MPITests(tf.test.TestCase):
                         "hvd.allreduce produces incorrect results")
 
     def test_horovod_allreduce_gpu(self):
-        """Test that the allreduce works on GPUs.
-
-        This test will crash badly if used with an MPI implementation that does
-        not support GPU memory transfers directly, as it will call MPI_Send on
-        a GPU data pointer."""
+        """Test that the allreduce works on GPUs."""
         # Only do this test if there are GPUs available.
         if not tf.test.is_gpu_available(cuda_only=True):
+            return
+
+        if os.environ.get('HOROVOD_MIXED_INSTALL'):
+            # Skip if compiled with CUDA but without HOROVOD_GPU_ALLREDUCE.
             return
 
         hvd.init()
@@ -187,6 +198,10 @@ class MPITests(tf.test.TestCase):
         if not tf.test.is_gpu_available(cuda_only=True):
             return
 
+        if os.environ.get('HOROVOD_MIXED_INSTALL'):
+            # Skip if compiled with CUDA but without HOROVOD_GPU_ALLREDUCE.
+            return
+
         hvd.init()
         local_rank = hvd.local_rank()
         size = hvd.size()
@@ -227,6 +242,10 @@ class MPITests(tf.test.TestCase):
         a GPU data pointer."""
         # Only do this test if there are GPUs available.
         if not tf.test.is_gpu_available(cuda_only=True):
+            return
+
+        if os.environ.get('HOROVOD_MIXED_INSTALL'):
+            # Skip if compiled with CUDA but without HOROVOD_GPU_ALLREDUCE.
             return
 
         hvd.init()
@@ -315,6 +334,10 @@ class MPITests(tf.test.TestCase):
         if not tf.test.is_gpu_available(cuda_only=True):
             return
 
+        if os.environ.get('HOROVOD_MIXED_INSTALL'):
+            # Skip if compiled with CUDA but without HOROVOD_GPU_ALLREDUCE.
+            return
+
         hvd.init()
         local_rank = hvd.local_rank()
         size = hvd.size()
@@ -331,8 +354,8 @@ class MPITests(tf.test.TestCase):
             with self.assertRaises(tf.errors.FailedPreconditionError):
                 self.evaluate(hvd.allreduce(tensor))
 
-    def test_horovod_allreduce_grad(self):
-        """Test the correctness of the allreduce gradient."""
+    def test_horovod_allreduce_grad_cpu(self):
+        """Test the correctness of the allreduce gradient on CPU."""
         hvd.init()
         size = hvd.size()
 
@@ -353,12 +376,55 @@ class MPITests(tf.test.TestCase):
                         [5] * dim, -100, 100, dtype=dtype)
                     summed = hvd.allreduce(tensor, average=False)
 
-            grad_ys = tf.ones([5] * dim)
-            if _executing_eagerly():
-                grad_out = tape.gradient(summed, tensor, grad_ys)
-            else:
-                grad = tf.gradients(summed, tensor, grad_ys)[0]
-                grad_out = self.evaluate(grad)
+                grad_ys = tf.ones([5] * dim)
+                if _executing_eagerly():
+                    grad_out = tape.gradient(summed, tensor, grad_ys)
+                else:
+                    grad = tf.gradients(summed, tensor, grad_ys)[0]
+                    grad_out = self.evaluate(grad)
+
+            expected = np.ones([5] * dim) * size
+            err = np.linalg.norm(expected - grad_out)
+            self.assertLess(err, 0.00000001,
+                            "gradient %s differs from expected %s, "
+                            "error: %s" % (grad_out, expected, str(err)))
+
+    def test_horovod_allreduce_grad_gpu(self):
+        """Test the correctness of the allreduce gradient on GPU."""
+        # Only do this test if there are GPUs available.
+        if not tf.test.is_gpu_available(cuda_only=True):
+            return
+
+        if os.environ.get('HOROVOD_MIXED_INSTALL'):
+            # Skip if compiled with CUDA but without HOROVOD_GPU_ALLREDUCE.
+            return
+
+        hvd.init()
+        local_rank = hvd.local_rank()
+        size = hvd.size()
+
+        # As of TensorFlow v1.9, gradients are not supported on
+        # integer tensors
+        dtypes = [tf.float32, tf.float64]
+        dims = [1, 2, 3]
+        for dtype, dim in itertools.product(dtypes, dims):
+            with tf.device("/gpu:%d" % local_rank):
+                tf.set_random_seed(1234)
+                if _executing_eagerly():
+                    tensor = self.tfe.Variable(
+                        tf.random_uniform([5] * dim, -100, 100, dtype=dtype))
+                    with tf.GradientTape() as tape:
+                        summed = hvd.allreduce(tensor, average=False)
+                else:
+                    tensor = tf.random_uniform([5] * dim, -100, 100, dtype=dtype)
+                    summed = hvd.allreduce(tensor, average=False)
+
+                grad_ys = tf.ones([5] * dim)
+                if _executing_eagerly():
+                    grad_out = tape.gradient(summed, tensor, grad_ys)
+                else:
+                    grad = tf.gradients(summed, tensor, grad_ys)[0]
+                    grad_out = self.evaluate(grad)
 
             expected = np.ones([5] * dim) * size
             err = np.linalg.norm(expected - grad_out)
@@ -589,8 +655,8 @@ class MPITests(tf.test.TestCase):
         with self.assertRaises(tf.errors.FailedPreconditionError):
             self.evaluate(hvd.allgather(tensor))
 
-    def test_horovod_allgather_grad(self):
-        """Test the correctness of the allgather gradient."""
+    def test_horovod_allgather_grad_cpu(self):
+        """Test the correctness of the allgather gradient on CPU."""
         hvd.init()
         rank = hvd.rank()
         size = hvd.size()
@@ -616,7 +682,8 @@ class MPITests(tf.test.TestCase):
                         g = tf.ones([tensor_size] + [17] * (dim - 1)) * r
                         grad_list.append(g)
                     grad_ys = tf.concat(grad_list, axis=0)
-                grad_out = tape.gradient(gathered, tensor, grad_ys)
+                with tf.device("/cpu:0"):
+                    grad_out = tape.gradient(gathered, tensor, grad_ys)
             else:
                 tensor = tf.ones([tensor_sizes[rank]] + [17] * (dim - 1)) * rank
                 if dtype == tf.bool:
@@ -630,7 +697,72 @@ class MPITests(tf.test.TestCase):
                     grad_list.append(g)
                 grad_ys = tf.concat(grad_list, axis=0)
 
-                grad = tf.gradients(gathered, tensor, grad_ys)[0]
+                with tf.device("/cpu:0"):
+                    grad = tf.gradients(gathered, tensor, grad_ys)[0]
+                grad_out = self.evaluate(grad)
+
+            expected = np.ones(
+                [tensor_sizes[rank]] + [17] * (dim - 1)
+            ) * rank * size
+            err = np.linalg.norm(expected - grad_out)
+            self.assertLess(err, 0.00000001,
+                            "gradient %s differs from expected %s, "
+                            "error: %s" %
+                            (grad_out, expected, str(err)))
+
+    def test_horovod_allgather_grad_gpu(self):
+        """Test the correctness of the allgather gradient on GPU."""
+        # Only do this test if there are GPUs available.
+        if not tf.test.is_gpu_available(cuda_only=True):
+            return
+
+        if os.environ.get('HOROVOD_MIXED_INSTALL'):
+            # Skip if compiled with CUDA but without HOROVOD_GPU_ALLGATHER.
+            return
+
+        hvd.init()
+        rank = hvd.rank()
+        local_rank = hvd.local_rank()
+        size = hvd.size()
+
+        # As of TensorFlow v1.9, gradients are not supported on
+        # integer tensors
+        dtypes = [tf.float32, tf.float64]
+        dims = [1, 2, 3]
+        for dtype, dim in itertools.product(dtypes, dims):
+            tensor_sizes = [3, 2, 7, 4, 6, 8, 10] * 5
+            tensor_sizes = tensor_sizes[:size]
+
+            if _executing_eagerly():
+                with tf.GradientTape() as tape:
+                    tensor = self.tfe.Variable(
+                        tf.ones([tensor_sizes[rank]] + [17] * (dim - 1)) * rank)
+                    if dtype == tf.bool:
+                        tensor = tensor % 2
+                    tensor = tf.cast(tensor, dtype=dtype)
+                    gathered = hvd.allgather(tensor)
+                    grad_list = []
+                    for r, tensor_size in enumerate(tensor_sizes):
+                        g = tf.ones([tensor_size] + [17] * (dim - 1)) * r
+                        grad_list.append(g)
+                    grad_ys = tf.concat(grad_list, axis=0)
+                with tf.device("/gpu:%d" % local_rank):
+                    grad_out = tape.gradient(gathered, tensor, grad_ys)
+            else:
+                tensor = tf.ones([tensor_sizes[rank]] + [17] * (dim - 1)) * rank
+                if dtype == tf.bool:
+                    tensor = tensor % 2
+                tensor = tf.cast(tensor, dtype=dtype)
+                gathered = hvd.allgather(tensor)
+
+                grad_list = []
+                for r, tensor_size in enumerate(tensor_sizes):
+                    g = tf.ones([tensor_size] + [17] * (dim - 1)) * r
+                    grad_list.append(g)
+                grad_ys = tf.concat(grad_list, axis=0)
+
+                with tf.device("/gpu:%d" % local_rank):
+                    grad = tf.gradients(gathered, tensor, grad_ys)[0]
                 grad_out = self.evaluate(grad)
 
             expected = np.ones(
@@ -720,8 +852,8 @@ class MPITests(tf.test.TestCase):
         with self.assertRaises(tf.errors.FailedPreconditionError):
             self.evaluate(hvd.broadcast(tensor, rank))
 
-    def test_horovod_broadcast_grad(self):
-        """Test the correctness of the broadcast gradient."""
+    def test_horovod_broadcast_grad_cpu(self):
+        """Test the correctness of the broadcast gradient on CPU."""
         hvd.init()
         rank = hvd.rank()
         size = hvd.size()
@@ -735,8 +867,7 @@ class MPITests(tf.test.TestCase):
         dtypes = [tf.float32, tf.float64]
         dims = [1, 2, 3]
         root_ranks = list(range(size))
-        for dtype, dim, root_rank in itertools.product(
-                dtypes, dims, root_ranks):
+        for dtype, dim, root_rank in itertools.product(dtypes, dims, root_ranks):
             if _executing_eagerly():
                 tensor = self.tfe.Variable(tf.ones([5] * dim) * rank)
             else:
@@ -747,13 +878,68 @@ class MPITests(tf.test.TestCase):
                 with tf.GradientTape() as tape:
                     tensor = tf.cast(tensor, dtype=dtype)
                     broadcasted_tensor = hvd.broadcast(tensor, root_rank)
-                grad_out = tape.gradient(broadcasted_tensor, tensor)
+                with tf.device("/cpu:0"):
+                    grad_out = tape.gradient(broadcasted_tensor, tensor)
             else:
                 tensor = tf.cast(tensor, dtype=dtype)
                 broadcasted_tensor = hvd.broadcast(tensor, root_rank)
 
                 grad_ys = tf.ones([5] * dim)
-                grad = tf.gradients(broadcasted_tensor, tensor, grad_ys)[0]
+                with tf.device("/cpu:0"):
+                    grad = tf.gradients(broadcasted_tensor, tensor, grad_ys)[0]
+                grad_out = self.evaluate(grad)
+
+            c = size if rank == root_rank else 0
+            expected = np.ones([5] * dim) * c
+            err = np.linalg.norm(expected - grad_out)
+            self.assertLess(err, 0.00000001,
+                            "gradient %s differs from expected %s, "
+                            "error: %s" % (grad_out, expected, str(err)))
+
+    def test_horovod_broadcast_grad_gpu(self):
+        """Test the correctness of the broadcast gradient on GPU."""
+        # Only do this test if there are GPUs available.
+        if not tf.test.is_gpu_available(cuda_only=True):
+            return
+
+        if os.environ.get('HOROVOD_MIXED_INSTALL'):
+            # Skip if compiled with CUDA but without HOROVOD_GPU_BROADCAST.
+            return
+
+        hvd.init()
+        rank = hvd.rank()
+        local_rank = hvd.local_rank()
+        size = hvd.size()
+
+        # This test does not apply if there is only one worker.
+        if size == 1:
+            return
+
+        # As of TensorFlow v1.9, gradients are not supported on
+        # integer tensors
+        dtypes = [tf.float32, tf.float64]
+        dims = [1, 2, 3]
+        root_ranks = list(range(size))
+        for dtype, dim, root_rank in itertools.product(dtypes, dims, root_ranks):
+            if _executing_eagerly():
+                tensor = self.tfe.Variable(tf.ones([5] * dim) * rank)
+            else:
+                tensor = tf.ones([5] * dim) * rank
+            if dtype == tf.bool:
+                tensor = tensor % 2
+            if _executing_eagerly():
+                with tf.GradientTape() as tape:
+                    tensor = tf.cast(tensor, dtype=dtype)
+                    broadcasted_tensor = hvd.broadcast(tensor, root_rank)
+                with tf.device("/gpu:%d" % local_rank):
+                    grad_out = tape.gradient(broadcasted_tensor, tensor)
+            else:
+                tensor = tf.cast(tensor, dtype=dtype)
+                broadcasted_tensor = hvd.broadcast(tensor, root_rank)
+
+                grad_ys = tf.ones([5] * dim)
+                with tf.device("/gpu:%d" % local_rank):
+                    grad = tf.gradients(broadcasted_tensor, tensor, grad_ys)[0]
                 grad_out = self.evaluate(grad)
 
             c = size if rank == root_rank else 0
@@ -800,7 +986,9 @@ class MPITests(tf.test.TestCase):
             self.assertLess(err, 0.00000001)
 
 
+if _has_eager:
+    from tensorflow.python.framework.test_util import run_all_in_graph_and_eager_modes
+    run_all_in_graph_and_eager_modes(MPITests)
+
 if __name__ == '__main__':
-    if _has_eager:
-        run_all_in_graph_and_eager_modes(MPITests())
     tf.test.main()

@@ -18,6 +18,7 @@
 
 #include "optim/bayesian_optimization.h"
 
+#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -79,13 +80,17 @@ public:
   double CycleTimeMs() const;
   void SetCycleTimeMs(double cycle_time_ms, bool fixed=false);
 
+  // Enable response caching.
+  bool CacheEnabled() const;
+  void SetCacheEnabled (bool enabled, bool fixed=false);
+
   // Observes that the given tensors have been processed (e.g., allreduced) over the given number of microseconds.
   //
   // Args:
   //  tensor_names: The names of the tensors that have been processed.
   //  bytes: The number of bytes that were processed per worker.
   //  microseconds: The number of microseconds taken to process the bytes on this worker.
-  void Update(const std::vector<std::string>& tensor_names, int64_t bytes, double microseconds);
+  void Update(const std::vector<std::string>& tensor_names, int64_t bytes);
 
 private:
   // Adjusts the parameter values based on the last observed score.
@@ -127,7 +132,12 @@ private:
     inline bool IsTunable() const override { return tunable_; };
 
   protected:
+    inline T InitialValue() const { return initial_value_; };
+
     void SetCurrentValue(T value);
+    void SetBestValue(T value);
+    void SetInitialValue(T value);
+
     void Reinitialize(T value);
 
   private:
@@ -182,6 +192,7 @@ private:
     void ResetState();
     void ResetBayes();
     Eigen::VectorXd FilterTestPoint(int i);
+    Eigen::VectorXd Remove(const Eigen::VectorXd& v, int index);
 
     std::vector<BayesianVariableConfig> variables_;
     std::vector<Eigen::VectorXd> test_points_;
@@ -201,6 +212,7 @@ private:
 
   CategoricalParameter<bool> hierarchical_allreduce_;
   CategoricalParameter<bool> hierarchical_allgather_;
+  CategoricalParameter<bool> cache_enabled_;
   BayesianParameter joint_params_;
 
   std::vector<ITunableParameter*> parameter_chain_;
@@ -212,7 +224,7 @@ private:
   int32_t sample_;
 
   int64_t total_bytes_;
-  double total_microseconds_;
+  std::chrono::steady_clock::time_point last_sample_start_;
   std::unordered_map<std::string, int32_t> tensor_counts_;
 
   int32_t rank_;
@@ -223,6 +235,7 @@ private:
   struct Params {
     bool hierarchical_allreduce;
     bool hierarchical_allgather;
+    bool cache_enabled;
     double tensor_fusion_threshold;
     double cycle_time;
     bool active;

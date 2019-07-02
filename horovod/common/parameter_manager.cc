@@ -28,7 +28,7 @@ namespace common {
 #define WARMUPS 3
 #define CYCLES_PER_SAMPLE 10
 #define BAYES_OPT_MAX_SAMPLES 20
-#define GAUSSIAN_PROCESS_NOISE 0.2
+#define GAUSSIAN_PROCESS_NOISE 0.8
 
 Eigen::VectorXd CreateVector(double x1, double x2) {
   Eigen::VectorXd v(2);
@@ -41,6 +41,7 @@ Eigen::VectorXd CreateVector(double x1, double x2) {
 ParameterManager::ParameterManager() :
     hierarchical_allreduce_(CategoricalParameter<bool>(std::vector<bool>{false, true})),
     hierarchical_allgather_(CategoricalParameter<bool>(std::vector<bool>{false, true})),
+    cache_enabled_(CategoricalParameter<bool>(std::vector<bool>{false, true})),
     joint_params_(BayesianParameter(
       std::vector<BayesianVariableConfig>{
         { BayesianVariable::fusion_buffer_threshold_mb, std::pair<double, double>(0, 64) },
@@ -51,7 +52,8 @@ ParameterManager::ParameterManager() :
         CreateVector(16, 25),
         CreateVector(8, 10)
       })),
-    parameter_chain_(std::vector<ITunableParameter*>{&joint_params_, &hierarchical_allreduce_, &hierarchical_allgather_}),
+    parameter_chain_(std::vector<ITunableParameter*>{&joint_params_, &hierarchical_allreduce_, &hierarchical_allgather_,
+                                                     &cache_enabled_}),
     active_(false),
     warmup_remaining_(WARMUPS),
     sample_(0),
@@ -62,16 +64,17 @@ ParameterManager::ParameterManager() :
 }
 
 void ParameterManager::CreateMpiTypes() {
-  const int nitems = 5;
-  int blocklengths[5] = {1, 1, 1, 1, 1};
-  MPI_Datatype types[5] = {MPI_CXX_BOOL, MPI_CXX_BOOL, MPI_DOUBLE, MPI_DOUBLE, MPI_CXX_BOOL};
+  const int nitems = 6;
+  int blocklengths[6] = {1, 1, 1, 1, 1, 1};
+  MPI_Datatype types[6] = {MPI_CXX_BOOL, MPI_CXX_BOOL, MPI_CXX_BOOL, MPI_DOUBLE, MPI_DOUBLE, MPI_CXX_BOOL};
 
-  MPI_Aint offsets[5];
+  MPI_Aint offsets[6];
   offsets[0] = offsetof(Params, hierarchical_allreduce);
   offsets[1] = offsetof(Params, hierarchical_allgather);
-  offsets[2] = offsetof(Params, tensor_fusion_threshold);
-  offsets[3] = offsetof(Params, cycle_time);
-  offsets[4] = offsetof(Params, active);
+  offsets[2] = offsetof(Params, cache_enabled);
+  offsets[3] = offsetof(Params, tensor_fusion_threshold);
+  offsets[4] = offsetof(Params, cycle_time);
+  offsets[5] = offsetof(Params, active);
 
   MPI_Type_create_struct(nitems, blocklengths, offsets, types, &mpi_params_type_);
   MPI_Type_commit(&mpi_params_type_);
@@ -88,12 +91,12 @@ void ParameterManager::Initialize(int32_t rank, int32_t root_rank, MPI_Comm mpi_
   root_rank_ = root_rank;
   mpi_comm_ = mpi_comm;
   if (rank_ == root_rank) {
-    LOG(INFO) << "Autotuner: Tunable params [hierarchical_allreduce,hierarchical_allgather,cycle_time_ms,tensor_fusion_threshold] score";
+    LOG(INFO) << "Autotuner: Tunable params [hierarchical_allreduce,hierarchical_allgather,cache_enabled,cycle_time_ms,tensor_fusion_threshold] score";
   }
   if (rank_ == root_rank && !file_name.empty()) {
     file_.open(file_name, std::ios::out | std::ios::trunc);
     if (file_.good()) {
-      file_ << "hierarchical_allreduce,hierarchical_allgather,cycle_time_ms,tensor_fusion_threshold,score" << std::endl;
+      file_ << "hierarchical_allreduce,hierarchical_allgather,cache_enabled,cycle_time_ms,tensor_fusion_threshold,score" << std::endl;
       writing_ = true;
     }
   }
@@ -122,6 +125,13 @@ void ParameterManager::SetHierarchicalAllgather(bool value, bool fixed) {
   hierarchical_allgather_.SetValue(value, fixed);
 }
 
+bool ParameterManager::CacheEnabled() const {
+  return active_ ? cache_enabled_.Value() : cache_enabled_.BestValue();
+};
+
+void ParameterManager::SetCacheEnabled(bool enabled, bool fixed) {
+  cache_enabled_.SetValue(enabled, fixed);
+}
 
 int64_t ParameterManager::TensorFusionThresholdBytes() const {
   double b = active_ ?
@@ -142,24 +152,26 @@ void ParameterManager::SetCycleTimeMs(double value, bool fixed) {
   joint_params_.SetValue(cycle_time_ms, value, fixed);
 }
 
-void ParameterManager::Update(const std::vector<std::string>& tensor_names, int64_t bytes, double microseconds) {
+void ParameterManager::Update(const std::vector<std::string>& tensor_names, int64_t bytes) {
   if (!active_) {
     return;
   }
 
   for (const std::string& tensor_name : tensor_names) {
     int32_t cycle = tensor_counts_[tensor_name]++;
-    if (cycle > sample_ * CYCLES_PER_SAMPLE) {
-      scores_[sample_] = total_bytes_ / total_microseconds_;
+    if (cycle >= (sample_ + 1) * CYCLES_PER_SAMPLE) {
+      auto now = std::chrono::steady_clock::now();
+      double duration = std::chrono::duration_cast<std::chrono::microseconds>(now - last_sample_start_).count();
+      scores_[sample_] = total_bytes_ / duration;
+
       total_bytes_ = 0;
-      total_microseconds_ = 0;
-      sample_++;
+      last_sample_start_ = now;
+      ++sample_;
       break;
     }
   }
 
   total_bytes_ += bytes;
-  total_microseconds_ += microseconds;
 
   if (sample_ >= SAMPLES) {
     std::sort(scores_, scores_ + SAMPLES);
@@ -217,12 +229,14 @@ void ParameterManager::SyncParams() {
       // We're actively tuning, so send the current value.
       params.hierarchical_allreduce = hierarchical_allreduce_.Value();
       params.hierarchical_allgather = hierarchical_allgather_.Value();
+      params.cache_enabled = cache_enabled_.Value();
       params.tensor_fusion_threshold = joint_params_.Value(fusion_buffer_threshold_mb);
       params.cycle_time = joint_params_.Value(cycle_time_ms);
     } else {
       // Tuning has completed, so send the best value.
       params.hierarchical_allreduce = hierarchical_allreduce_.BestValue();
       params.hierarchical_allgather = hierarchical_allgather_.BestValue();
+      params.cache_enabled = cache_enabled_.BestValue();
       params.tensor_fusion_threshold = joint_params_.BestValue(fusion_buffer_threshold_mb);
       params.cycle_time = joint_params_.BestValue(cycle_time_ms);
     }
@@ -237,6 +251,7 @@ void ParameterManager::SyncParams() {
   if (rank_ != root_rank_) {
     hierarchical_allreduce_.SetValue(params.hierarchical_allreduce, true);
     hierarchical_allgather_.SetValue(params.hierarchical_allgather, true);
+    cache_enabled_.SetValue(params.cache_enabled, true);
     joint_params_.SetValue(fusion_buffer_threshold_mb, params.tensor_fusion_threshold, true);
     joint_params_.SetValue(cycle_time_ms, params.cycle_time, true);
     active_ = params.active;
@@ -245,7 +260,7 @@ void ParameterManager::SyncParams() {
 
 void ParameterManager::Reset() {
   total_bytes_ = 0;
-  total_microseconds_ = 0;
+  last_sample_start_ = std::chrono::steady_clock::now();
   tensor_counts_.clear();
   sample_ = 0;
 }
@@ -255,12 +270,14 @@ void ParameterManager::LogParameters(double score) {
     LOG(INFO) << "Autotuner: ["
               << hierarchical_allreduce_.Value() << ", "
               << hierarchical_allgather_.Value() << ", "
+              << cache_enabled_.Value() << ", "
               << joint_params_.Value(cycle_time_ms) << " ms, "
               << joint_params_.Value(fusion_buffer_threshold_mb) << " mb] "
               << score;
     if (writing_ && file_.good()) {
       file_ << hierarchical_allreduce_.Value() << ","
             << hierarchical_allgather_.Value() << ","
+            << cache_enabled_.Value() << ","
             << joint_params_.Value(cycle_time_ms) << ","
             << joint_params_.Value(fusion_buffer_threshold_mb) << ","
             << score
@@ -274,12 +291,14 @@ void ParameterManager::LogBestParameters() {
     LOG(INFO) << "Autotuner: Best params ["
               << hierarchical_allreduce_.BestValue() << ", "
               << hierarchical_allgather_.BestValue() << ", "
+              << cache_enabled_.BestValue() << ", "
               << joint_params_.BestValue(cycle_time_ms) << " ms, "
               << joint_params_.BestValue(fusion_buffer_threshold_mb) << " mb] "
               << hierarchical_allreduce_.BestScore();
     if (writing_ && file_.good()) {
       file_ << hierarchical_allreduce_.BestValue() << ","
             << hierarchical_allgather_.BestValue() << ","
+            << cache_enabled_.BestValue() << ","
             << joint_params_.BestValue(cycle_time_ms) << ","
             << joint_params_.BestValue(fusion_buffer_threshold_mb) << ","
             << hierarchical_allreduce_.BestScore()
@@ -338,6 +357,16 @@ void ParameterManager::TunableParameter<T>::SetCurrentValue(T value) {
 }
 
 template <class T>
+void ParameterManager::TunableParameter<T>::SetBestValue(T value) {
+  best_value_ = value;
+}
+
+template <class T>
+void ParameterManager::TunableParameter<T>::SetInitialValue(T value) {
+  initial_value_ = value;
+}
+
+template <class T>
 void ParameterManager::TunableParameter<T>::Reinitialize(T value) {
   initial_value_ = value;
   value_ = value;
@@ -361,7 +390,7 @@ ParameterManager::CategoricalParameter<T>::CategoricalParameter(std::vector<T> v
 
 template <class T>
 void ParameterManager::CategoricalParameter<T>::OnTune(double score, T& value) {
-  index_++;
+  ++index_;
   if (index_ < values_.size()) {
     value = values_[index_];
   }
@@ -386,11 +415,25 @@ ParameterManager::BayesianParameter::BayesianParameter(
     test_points_(test_points),
     iteration_(0) {
   ResetBayes();
+  Reinitialize(FilterTestPoint(0));
   ResetState();
 }
 
 void ParameterManager::BayesianParameter::SetValue(BayesianVariable variable, double value, bool fixed) {
   if (fixed) {
+    // Only remove this variable if it hasn't already been fixed
+    if (fixed_values_.find(variable) == fixed_values_.end()) {
+      // Fixed parameter values cannot be changed, and will be removed from the Bayesian optimization
+      // process so the search space can be reduced. To remove the parameter from the optimizer, we need
+      // to also remove it from the vector outputs of the optimization process. First we find the index
+      // of the variable we're removing in the existing vectors, then for each of the current, best, and
+      // initial value vectors, we remove that index to create a smaller vector, and reset those values.
+      int32_t index = index_[variable];
+      TunableParameter::SetCurrentValue(Remove(TunableParameter::Value(), index));
+      TunableParameter::SetBestValue(Remove(TunableParameter::BestValue(), index));
+      TunableParameter::SetInitialValue(Remove(TunableParameter::InitialValue(), index));
+    }
+
     fixed_values_[variable] = value;
     ResetBayes();
   } else {
@@ -419,7 +462,7 @@ double ParameterManager::BayesianParameter::BestValue(BayesianVariable variable)
 void ParameterManager::BayesianParameter::OnTune(double score, Eigen::VectorXd& value) {
   bayes_->AddSample(value, score);
 
-  iteration_++;
+  ++iteration_;
   if (iteration_ < test_points_.size()) {
     value = FilterTestPoint(iteration_);
   } else {
@@ -445,12 +488,11 @@ void ParameterManager::BayesianParameter::ResetBayes() {
     if (fixed_values_.find(var.variable) == fixed_values_.end()) {
       bounds.push_back(var.bounds);
       index_[var.variable] = j;
-      j++;
+      ++j;
     }
   }
 
   bayes_.reset(new BayesianOptimization(bounds, GAUSSIAN_PROCESS_NOISE));
-  Reinitialize(FilterTestPoint(0));
 }
 
 Eigen::VectorXd ParameterManager::BayesianParameter::FilterTestPoint(int i) {
@@ -458,12 +500,33 @@ Eigen::VectorXd ParameterManager::BayesianParameter::FilterTestPoint(int i) {
   Eigen::VectorXd filtered_point(test_point.size() - fixed_values_.size());
 
   int k = 0;
-  for (int j = 0; j < test_point.size(); j++) {
+  for (int j = 0; j < test_point.size(); ++j) {
     BayesianVariable variable = variables_[j].variable;
     if (fixed_values_.find(variable) == fixed_values_.end()) {
       filtered_point(k) = test_point(j);
-      k++;
+      ++k;
     }
+  }
+
+  return filtered_point;
+}
+
+Eigen::VectorXd ParameterManager::BayesianParameter::Remove(const Eigen::VectorXd& v, int index) {
+  if (v.size() == 0) {
+    // Vector is already empty, nothing to do
+    return v;
+  }
+
+  Eigen::VectorXd filtered_point(v.size() - 1);
+
+  int k = 0;
+  for (int j = 0; j < v.size(); ++j) {
+    if (j == index) {
+      continue;
+    }
+
+    filtered_point(k) = v(j);
+    ++k;
   }
 
   return filtered_point;

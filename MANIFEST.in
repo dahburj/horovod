@@ -1,4 +1,4 @@
-recursive-include * *.h *.cc *.md
+recursive-include * *.h *.hpp *.cc *.md
 
 include LICENSE horovod.lds horovod.exp
 prune .eggs
@@ -14,3 +14,8 @@ exclude third_party/eigen/Eigen/SparseLU
 exclude third_party/eigen/Eigen/src/IterativeSolvers/*
 exclude third_party/eigen/Eigen/src/OrderingMethods/Amd.h
 exclude third_party/eigen/Eigen/src/SparseCholesky/*
+
+# include cmake related files for submodule gloo
+graft third_party/gloo/cmake
+recursive-include third_party/gloo CMakeLists.txt
+recursive-include third_party/gloo *.in
